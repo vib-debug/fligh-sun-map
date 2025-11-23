@@ -1,0 +1,114 @@
+# --- Step 1: Install packages ---
+!pip install flight_sun folium astral pytz ipywidgets
+
+# --- Step 2: Imports ---
+from flight_sun.flight import Flight
+from datetime import datetime, timedelta
+import folium
+from IPython.display import display
+import ipywidgets as widgets
+from math import radians, degrees, atan2, sin, cos
+from astral import LocationInfo
+from astral.sun import azimuth
+import pytz
+
+# --- Step 3: Input widgets ---
+origin_input = widgets.Text(value='LHR', description='Origin (IATA):')
+destination_input = widgets.Text(value='PER', description='Destination (IATA):')
+takeoff_input = widgets.Text(value='2023-02-11 11:50', description='Takeoff (YYYY-MM-DD HH:MM):')
+landing_input = widgets.Text(value='2023-02-12 12:25', description='Landing (YYYY-MM-DD HH:MM):')
+button = widgets.Button(description="Generate Flight Sun Map")
+display(origin_input, destination_input, takeoff_input, landing_input, button)
+
+# --- Step 4: Helper functions ---
+def bearing(lat1, lon1, lat2, lon2):
+    dLon = radians(lon2 - lon1)
+    lat1 = radians(lat1)
+    lat2 = radians(lat2)
+    x = sin(dLon) * cos(lat2)
+    y = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon)
+    initial_bearing = atan2(x, y)
+    initial_bearing = degrees(initial_bearing)
+    return (initial_bearing + 360) % 360
+
+def get_sun_azimuth(lat, lon, dt):
+    city = LocationInfo(latitude=lat, longitude=lon)
+    return azimuth(city.observer, dt)  # dt must be timezone-aware
+
+# Function to project sun position from plane using azimuth
+def project_sun(lat, lon, az, distance_km=500):
+    # Approximate using simple equirectangular projection
+    R = 6371  # Earth radius km
+    az_rad = radians(az)
+    delta_lat = (distance_km / R) * cos(az_rad)
+    delta_lon = (distance_km / (R * cos(radians(lat)))) * sin(az_rad)
+    sun_lat = lat + degrees(delta_lat)
+    sun_lon = lon + degrees(delta_lon)
+    return sun_lat, sun_lon
+
+# --- Step 5: Generate map ---
+def generate_map(b):
+    try:
+        # Times as UTC
+        take_off_time = datetime.fromisoformat(takeoff_input.value).replace(tzinfo=pytz.UTC)
+        landing_time = datetime.fromisoformat(landing_input.value).replace(tzinfo=pytz.UTC)
+        
+        # Flight object
+        flight = Flight.from_iata_codes(origin_input.value.upper(), destination_input.value.upper(),
+                                        take_off_time, landing_time)
+        
+        # Flight bearing
+        flight_bearing = bearing(flight.origin.latitude, flight.origin.longitude,
+                                 flight.destination.latitude, flight.destination.longitude)
+        
+        # Map setup
+        mid_lat = (flight.origin.latitude + flight.destination.latitude)/2
+        mid_lon = (flight.origin.longitude + flight.destination.longitude)/2
+        m = folium.Map(location=[mid_lat, mid_lon], zoom_start=3)
+        
+        # Time step 10 minutes for demonstration
+        step_seconds = 600
+        total_seconds = int((landing_time - take_off_time).total_seconds())
+        
+        # Generate points along flight
+        lat1, lon1 = flight.origin.latitude, flight.origin.longitude
+        lat2, lon2 = flight.destination.latitude, flight.destination.longitude
+        
+        for t in range(0, total_seconds+1, step_seconds):
+            frac = t / total_seconds
+            plane_lat = lat1 + (lat2 - lat1) * frac
+            plane_lon = lon1 + (lon2 - lon1) * frac
+            current_time = take_off_time + timedelta(seconds=t)
+            
+            # Sun azimuth
+            sun_az = get_sun_azimuth(plane_lat, plane_lon, current_time)
+            angle_diff = (sun_az - flight_bearing + 360) % 360
+            side = "right" if 0 <= angle_diff <= 180 else "left"
+            
+            # Project sun to approximate geographic position
+            sun_lat, sun_lon = project_sun(plane_lat, plane_lon, sun_az, distance_km=500)
+            
+            # Determine sunlight for tooltip
+            sun_up = any(seg.start <= current_time <= seg.end and seg.sun_up for seg in flight.light_segments)
+            tooltip_text = f"Time: {current_time}\nSun side: {side}\nSun up: {sun_up}"
+            
+            # Add plane marker
+            folium.CircleMarker([plane_lat, plane_lon], radius=4, color='black', fill=True,
+                                popup=f"Plane at {current_time}").add_to(m)
+            
+            # Add sun marker
+            if sun_up:
+                folium.Marker([sun_lat, sun_lon], icon=folium.Icon(color='orange', icon='sun', prefix='fa'),
+                              popup=tooltip_text).add_to(m)
+        
+        # Flight line
+        folium.PolyLine(locations=[(lat1, lon1),(lat2, lon2)], color='gray', weight=2, dash_array='5').add_to(m)
+        display(m)
+        
+        print(f"Sunlight proportion: {flight.proportion_in_sunlight():.2%}")
+        
+    except Exception as e:
+        print("Error:", e)
+
+# --- Step 6: Link button ---
+button.on_click(generate_map)
